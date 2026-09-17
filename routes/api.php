@@ -134,7 +134,8 @@ Route::prefix('v1')->name('api.v1.')->group(function (): void {
             Route::delete('/user', [V1ProfileController::class, 'destroy'])->name('user.destroy');
 
             // Password Confirmation
-            Route::post('/user/confirm-password', [V1PasswordConfirmationController::class, 'confirm'])
+            Route::middleware('throttle:api-password-confirmation')
+                ->post('/user/confirm-password', [V1PasswordConfirmationController::class, 'confirm'])
                 ->name('user.confirm-password');
 
             // Sessions

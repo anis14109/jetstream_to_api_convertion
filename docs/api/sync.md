@@ -114,6 +114,9 @@ Rules:
   delivered returns `422` on `cursor`.
 - `cursor <= acknowledged_cursor` is an idempotent no-op that returns `200`, so
   clients can ACK safely after a retry.
+- Both checkpoints are **strictly monotonic**. Every update compares-and-assigns
+  in a single atomic `UPDATE` (`CASE WHEN stored > value`), so an out-of-order
+  or concurrent ACK/pull can never move a checkpoint backwards.
 
 ### `POST /sync/push`
 
@@ -172,6 +175,14 @@ payload:
 
 `IDEMPOTENCY_CONFLICT` and `IDEMPOTENCY_IN_PROGRESS` responses put the offending
 operations in `data.idempotency_conflicts` / `data.pending`.
+
+Concurrency is enforced by the database, not by application checks: a unique
+index on `(user_id, key_hash)` allows exactly one reservation to be inserted.
+A racing request therefore observes the winning reservation (in-flight or
+completed) and never executes the operation twice. If an operation fails, its
+reservation is removed with the surrounding transaction, so the client may
+retry the same `operation_id`. Reservations that never complete are reported as
+`pending`.
 
 #### Success response (`200`)
 
@@ -253,9 +264,16 @@ command (see `routes/console.php`) deletes only entries that:
   user.
 
 A user with no sync cursor is never pruned. Set
-`SYNC_CHANGE_LOG_RETENTION_DAYS=0` to keep entries forever. Run it manually
-with `php artisan sync:prune-change-log` (add `--dry-run` to preview,
-`--days=N` to override the window).
+`SYNC_CHANGE_LOG_RETENTION_DAYS=0` to keep entries forever.
+
+The same command also prunes **completed** idempotency records older than
+`SYNC_IDEMPOTENCY_RETENTION_DAYS` (default **30** days). Pending reservations
+are never removed: a very late retry inside the retention window still replays
+instead of executing twice, so the window must exceed the longest client retry
+delay. Set `SYNC_IDEMPOTENCY_RETENTION_DAYS=0` to keep them forever.
+
+Run it manually with `php artisan sync:prune-change-log` (add `--dry-run` to
+preview, `--days=N` / `--idempotency-days=N` to override either window).
 
 ## Recommended client loop
 

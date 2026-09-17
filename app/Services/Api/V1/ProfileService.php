@@ -17,14 +17,18 @@ class ProfileService
     public function __construct(private readonly RefreshTokenService $refreshTokens) {}
 
     /**
+     * Update the profile. Changing the email address clears `email_verified_at`
+     * so the new address can never inherit the verification of the old one, and
+     * a fresh verification notification is sent after the change is committed.
+     *
      * @param  array{name: string, email: string}  $data
      */
     public function updateProfile(User $user, array $data): User
     {
-        return DB::transaction(function () use ($user, $data): User {
-            $email = Str::lower($data['email']);
-            $emailChanged = $user->email !== $email;
+        $email = Str::lower($data['email']);
+        $emailChanged = $user->email !== $email;
 
+        $user = DB::transaction(function () use ($user, $data, $email, $emailChanged): User {
             $attributes = [
                 'name' => $data['name'],
                 'email' => $email,
@@ -36,12 +40,17 @@ class ProfileService
 
             $user->forceFill($attributes)->save();
 
-            if ($emailChanged && $user instanceof MustVerifyEmail) {
-                $user->sendEmailVerificationNotification();
-            }
-
             return $user->refresh();
         });
+
+        // Only notify once the transaction has committed, and only when the
+        // address actually changed, so we never send a link that points at a
+        // rolled-back value or spam an unchanged address.
+        if ($emailChanged && $user instanceof MustVerifyEmail) {
+            $user->sendEmailVerificationNotification();
+        }
+
+        return $user;
     }
 
     /**

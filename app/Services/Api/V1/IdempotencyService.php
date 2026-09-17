@@ -5,6 +5,7 @@ namespace App\Services\Api\V1;
 use App\Models\IdempotencyKey;
 use App\Models\User;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Guarantees that a retried mutation is applied at most once.
@@ -49,7 +50,30 @@ class IdempotencyService
     }
 
     /**
+     * A snapshot-safe lookup used after a unique-constraint violation. A plain
+     * SELECT can use a transaction's older consistent snapshot and miss the row
+     * the winning request just committed, so we force a locking read that sees
+     * the latest committed state.
+     */
+    private function findForUpdate(User $user, string $operationId): ?IdempotencyKey
+    {
+        return IdempotencyKey::query()
+            ->where('user_id', $user->id)
+            ->where('key_hash', $this->hashOperation($user, $operationId))
+            ->lockForUpdate()
+            ->first();
+    }
+
+    /**
      * Reserve the operation id before executing the business operation.
+     *
+     * The INSERT is wrapped in its own (nested) transaction so that, on
+     * databases that abort a transaction after a constraint violation
+     * (PostgreSQL), the failed reservation is rolled back to a savepoint and the
+     * surrounding push transaction stays usable. The unique index on
+     * (user_id, key_hash) is the real arbiter: exactly one concurrent request
+     * can insert the row, every other request observes the in-flight or
+     * completed record instead.
      *
      * @return array{status: 'new'|'replay'|'conflict'|'pending', key: ?IdempotencyKey, response: ?array<string, mixed>}
      */
@@ -62,7 +86,7 @@ class IdempotencyService
         string $operation,
     ): array {
         try {
-            $key = IdempotencyKey::create([
+            $key = DB::transaction(fn (): IdempotencyKey => IdempotencyKey::create([
                 'user_id' => $user->id,
                 'key_hash' => $this->hashOperation($user, $operationId),
                 'request_hash' => $fingerprint,
@@ -72,13 +96,13 @@ class IdempotencyService
                 'response_code' => 200,
                 'response_json' => null,
                 'completed_at' => null,
-            ]);
+            ]));
 
             return ['status' => 'new', 'key' => $key, 'response' => null];
         } catch (QueryException $exception) {
             // The unique (user_id, key_hash) index fired: another request owns
             // this operation id. Inspect its state to decide how to respond.
-            $existing = $this->find($user, $operationId);
+            $existing = $this->findForUpdate($user, $operationId);
 
             if (! $existing) {
                 throw $exception;

@@ -28,6 +28,17 @@ class StudentService
     public function create(User $user, array $data, ?string $id = null): array
     {
         return DB::transaction(function () use ($user, $data, $id): array {
+            if ($id !== null && Student::withTrashed()->whereKey($id)->exists()) {
+                // The identifier is already taken. The sync handler reports the
+                // owner's own record with a snapshot; this guard covers the REST
+                // path and cross-user collisions without leaking any data.
+                throw ConflictException::forResource([
+                    'entity_type' => self::ENTITY_TYPE,
+                    'entity_id' => $id,
+                    'reason' => 'already_exists',
+                ]);
+            }
+
             $student = new Student;
 
             if ($id !== null) {
@@ -68,12 +79,15 @@ class StudentService
             );
 
             $affected = Student::query()
+                ->where('user_id', $user->id)
                 ->whereKey($student->id)
                 ->where('version', $expected)
                 ->update($attributes);
 
             if ($affected !== 1) {
-                $current = Student::withTrashed()->find($student->id);
+                $current = Student::withTrashed()
+                    ->where('user_id', $user->id)
+                    ->find($student->id);
 
                 throw ConflictException::forResource([
                     'entity_type' => self::ENTITY_TYPE,
@@ -109,6 +123,7 @@ class StudentService
             $deletedAt = now();
 
             $affected = Student::query()
+                ->where('user_id', $user->id)
                 ->whereKey($student->id)
                 ->where('version', $expected)
                 ->update([
@@ -118,7 +133,9 @@ class StudentService
                 ]);
 
             if ($affected !== 1) {
-                $current = Student::withTrashed()->find($student->id);
+                $current = Student::withTrashed()
+                    ->where('user_id', $user->id)
+                    ->find($student->id);
 
                 throw ConflictException::forResource([
                     'entity_type' => self::ENTITY_TYPE,

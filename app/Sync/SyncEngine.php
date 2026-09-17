@@ -30,6 +30,15 @@ use Illuminate\Support\Facades\DB;
  */
 class SyncEngine
 {
+    /**
+     * Cursor columns that must only ever move forward. Every write to them
+     * goes through {@see self::advanceCursor()} so a slow or out-of-order
+     * request can never roll a checkpoint back.
+     *
+     * @var array<int, string>
+     */
+    private const MONOTONIC_COLUMNS = ['last_pulled_cursor', 'acknowledged_cursor'];
+
     public function __construct(
         private readonly ChangeTracker $changeTracker,
         private readonly IdempotencyService $idempotency,
@@ -84,11 +93,11 @@ class SyncEngine
         $nextCursor = (int) ($page->last()?->id ?? $start);
 
         // "Pulling" means the changes were delivered; it does not mean the
-        // client applied them. Only the delivered revision range is recorded.
+        // client applied them. Only the delivered revision range is recorded,
+        // and only ever moving the checkpoint forward (atomic `max`, so two
+        // concurrent pulls cannot roll it back).
         $delivered = max($start, $nextCursor);
-        if ($delivered > $syncCursor->last_pulled_cursor) {
-            $this->updateCursor($user, $clientId, ['last_pulled_cursor' => $delivered]);
-        }
+        $this->advanceCursor($user, $clientId, 'last_pulled_cursor', $delivered);
 
         return [
             'items' => $page,
@@ -107,28 +116,40 @@ class SyncEngine
      */
     public function ack(User $user, string $clientId, int $cursor): array
     {
-        $syncCursor = $this->cursor($user, $clientId);
-
         if ($cursor < 0) {
             throw ApiException::validation(['cursor' => ['The cursor must be a non-negative integer.']]);
         }
 
-        // Stale/duplicate ACK: already applied, nothing to do.
-        if ($cursor <= $syncCursor->acknowledged_cursor) {
-            return $this->ackPayload($syncCursor);
-        }
+        return DB::transaction(function () use ($user, $clientId, $cursor): array {
+            // Make sure the row exists, then lock it for the duration of the
+            // validation + write so two concurrent ACKs cannot interleave.
+            $this->cursor($user, $clientId);
 
-        // A client may only acknowledge changes that have been delivered to it.
-        if ($cursor > $syncCursor->last_pulled_cursor) {
-            throw ApiException::validation(
-                ['cursor' => ['The cursor is ahead of the last change delivered to this client. Pull before acknowledging.']],
-                'The cursor is invalid for this client.',
-            );
-        }
+            $syncCursor = SyncCursor::query()
+                ->where('user_id', $user->id)
+                ->where('client_id', $clientId)
+                ->lockForUpdate()
+                ->firstOrFail();
 
-        $this->updateCursor($user, $clientId, ['acknowledged_cursor' => $cursor]);
+            // Stale/duplicate ACK: already applied, nothing to do.
+            if ($cursor <= $syncCursor->acknowledged_cursor) {
+                return $this->ackPayload($syncCursor);
+            }
 
-        return $this->ackPayload($this->cursor($user, $clientId));
+            // A client may only acknowledge changes that have been delivered to it.
+            if ($cursor > $syncCursor->last_pulled_cursor) {
+                throw ApiException::validation(
+                    ['cursor' => ['The cursor is ahead of the last change delivered to this client. Pull before acknowledging.']],
+                    'The cursor is invalid for this client.',
+                );
+            }
+
+            // Atomic `max` guard: even without the row lock the checkpoint can
+            // never move backwards.
+            $this->advanceCursor($user, $clientId, 'acknowledged_cursor', $cursor);
+
+            return $this->ackPayload($syncCursor->refresh());
+        });
     }
 
     /**
@@ -343,13 +364,33 @@ class SyncEngine
     }
 
     /**
-     * @param  array<string, int>  $attributes
+     * Atomically advance a monotonic checkpoint to at least `$value`.
+     *
+     * The comparison and assignment happen inside a single UPDATE using a
+     * `CASE ... max` expression, which is portable across MySQL, PostgreSQL and
+     * SQLite. A concurrent request that computed a smaller value can therefore
+     * never overwrite a larger one: the database, not application code, decides.
      */
-    private function updateCursor(User $user, string $clientId, array $attributes): void
+    private function advanceCursor(User $user, string $clientId, string $column, int $value): void
     {
+        if (! in_array($column, self::MONOTONIC_COLUMNS, true)) {
+            throw new \InvalidArgumentException("Unknown sync cursor column [{$column}].");
+        }
+
+        // $column is whitelisted above and $value is an int, so the raw
+        // expression cannot contain user input.
+        $expression = sprintf(
+            'CASE WHEN %1$s > %2$d THEN %1$s ELSE %2$d END',
+            $column,
+            max(0, $value),
+        );
+
         SyncCursor::query()
             ->where('user_id', $user->id)
             ->where('client_id', $clientId)
-            ->update($attributes + ['updated_at' => now()]);
+            ->update([
+                $column => DB::raw($expression),
+                'updated_at' => now(),
+            ]);
     }
 }

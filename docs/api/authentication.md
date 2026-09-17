@@ -186,6 +186,23 @@ the authenticated routes (profile, sessions, 2FA, sync and students); `logout`,
 `/auth/me` and the verification resend endpoint stay reachable, and blocked
 requests return `403 EMAIL_NOT_VERIFIED`.
 
+### Changing the email address
+
+Updating the account email through `PATCH /user` starts a fresh verification
+cycle:
+
+- `email_verified_at` is cleared, so `data.email_verified_at` becomes `null`.
+- If verification is enabled, a new verification email is sent to the **new**
+  address (the notification is dispatched after the database transaction
+  commits).
+- The previous verification link becomes invalid: it carries the hash of the
+  old address, so it returns `403 FORBIDDEN`.
+- Saving the same email again is a no-op: verification is not reset and no
+  notification is sent.
+
+This prevents an email change from inheriting the trust of the previous,
+already-verified address.
+
 ## Password reset
 
 `POST /auth/forgot-password` — rate limit `api-password-reset`

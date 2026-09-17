@@ -55,6 +55,9 @@ return [
     |   before pruning, but only entries every client has acknowledged. 0 means
     |   keep forever. Pruned automatically by the `sync:prune-change-log`
     |   command, scheduled in routes/console.php.
+    | - idempotency_retention_days: number of days to keep completed idempotency
+    |   records. Must exceed the longest client retry window so a late retry is
+    |   still replayed instead of executing twice. 0 means keep forever.
     |
     */
 
@@ -64,6 +67,7 @@ return [
         'max_operations_per_push' => env('SYNC_MAX_OPERATIONS_PER_PUSH', 200),
         'cursor_policy' => env('SYNC_CURSOR_POLICY', 'monotonic_revisions'),
         'change_log_retention_days' => env('SYNC_CHANGE_LOG_RETENTION_DAYS', 30),
+        'idempotency_retention_days' => env('SYNC_IDEMPOTENCY_RETENTION_DAYS', 30),
     ],
 
     /*

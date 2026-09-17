@@ -70,6 +70,36 @@ contract, then replace or extend it with your own resources by writing a
 `SyncResourceHandler` and registering it in `SyncServiceProvider` (see
 `docs/api/sync.md`).
 
+### Concurrency primitives used (all portable)
+
+No database-specific SQL is used, so the same code runs on MySQL 8, PostgreSQL
+13+ and SQLite:
+
+- **Idempotency** relies on a unique index on `idempotency_keys (user_id,
+  key_hash)` plus a reservation row inserted in its own savepoint
+  (`DB::transaction`). On PostgreSQL, which aborts a transaction after a
+  constraint violation, the savepoint keeps the surrounding push transaction
+  usable. After a violation the existing row is read with `lockForUpdate()` so
+  the winner's just-committed state is visible.
+- **Cursor monotonicity** is a single `UPDATE` whose value is
+  `CASE WHEN column > :value THEN column ELSE :value END`, so the database (not
+  application logic) decides whether a checkpoint moves.
+- **ACK** locks the cursor row with `lockForUpdate()` inside a transaction, with
+  the atomic `max` update as a second line of defence.
+
+Most suites use the in-memory SQLite database and assert the mechanisms that
+make concurrency safe (unique-index violation handling, reservation state
+machine, monotonic updates). `tests/Feature/Sync/ConcurrencyTest.php` goes
+further: it runs the operations in genuinely parallel OS processes against a
+shared file-backed SQLite database, releasing every worker through a filesystem
+barrier so they collide on the same rows, then asserts that a shared operation
+id is reserved exactly once and that concurrently-acknowledged cursors converge
+on the maximum value without ever regressing. SQLite cannot upgrade a deferred
+read transaction to a writer without risking `SQLITE_BUSY`, so the worker
+retries lock contention; production runs on MySQL/PostgreSQL, where
+`lockForUpdate()` serialises the writers. The test skips automatically when
+`pdo_sqlite` or child-process spawning is unavailable.
+
 ## 3. Wire it up
 
 ### `routes/api.php`
@@ -167,6 +197,7 @@ SYNC_PULL_BATCH_SIZE=200
 SYNC_PUSH_BATCH_SIZE=100
 SYNC_MAX_OPERATIONS_PER_PUSH=200
 SYNC_CHANGE_LOG_RETENTION_DAYS=30
+SYNC_IDEMPOTENCY_RETENTION_DAYS=30
 
 EMAIL_VERIFICATION_ENABLED=true
 EMAIL_VERIFICATION_ENFORCE=false

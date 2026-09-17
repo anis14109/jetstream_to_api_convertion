@@ -66,10 +66,21 @@ backwards compatibility.
 - **Idempotent push with payload binding**: an `operation_id` is reserved before
   the write, replaying the same payload returns the stored response
   (`replayed`), a different payload returns `409 IDEMPOTENCY_CONFLICT`, and an
-  in-flight reservation returns `409 IDEMPOTENCY_IN_PROGRESS`.
+  in-flight reservation returns `409 IDEMPOTENCY_IN_PROGRESS`. The reservation is
+  enforced by a unique index on `(user_id, key_hash)` and written in its own
+  savepoint, so a racing request can never execute the operation twice on MySQL,
+  PostgreSQL or SQLite; a failed operation removes its reservation with the
+  surrounding transaction.
+- **Strictly monotonic cursors**: `last_pulled_cursor` and `acknowledged_cursor`
+  are advanced with a single atomic `CASE WHEN stored > value` update, so
+  out-of-order or concurrent pulls/ACKs can never move a checkpoint backwards.
 - **ACK-aware pruning**: `sync:prune-change-log` (scheduled daily) deletes only
   entries older than the retention window and not beyond the slowest client's
-  acknowledged cursor.
+  acknowledged cursor, and also removes completed idempotency records past
+  `sync.idempotency_retention_days` (pending reservations are never removed).
+- **Email-change re-verification**: changing the account email clears
+  `email_verified_at`, sends a fresh notification to the new address after commit
+  and invalidates the previous verification link.
 - Soft-delete tombstones so deletions propagate.
 
 ### Example resource
@@ -113,17 +124,25 @@ backwards compatibility.
 
 ```
 php artisan test --compact
-171 tests, 167 passed, 4 skipped, 556 assertions
+216 tests, 215 passed, 1 skipped, 699 assertions
 ```
 
 - `tests/Feature/Api/V1` — auth, profile, password reset, password confirmation,
   2FA, sessions, students, sync, a generic-engine test proving an arbitrary
   registered resource round-trips and where each conflict policy is exercised,
-  and email verification.
+  and email verification. The hardening pass added `IdempotencyTest` (reservation
+  state machine and unique-index guarantees), `SyncCursorTest` (forward-only,
+  out-of-order, duplicate and invalid ACK handling), `EmailChangeTest`
+  (re-verification and notification on address change) and `SyncSecurityTest`
+  (cross-user entity, snapshot, cursor and ACK isolation).
 - `tests/Feature/Sync` — change-log pruning (retention, slowest-client
-  acknowledgement, dry-run, disabled).
-- 4 skipped tests are pre-existing Jetstream feature-gate skips, unchanged by
-  this work.
+  acknowledgement, dry-run, disabled, idempotency-key pruning) and
+  `ConcurrencyTest`, which runs parallel OS processes against a shared
+  file-backed SQLite database to prove exactly-once reservation and
+  non-regressing cursor ACKs under real contention.
+- 1 skipped test is a pre-existing Jetstream feature-gate skip; the Fortify
+  email-verification feature that restores the `verification.*` routes also
+  re-enabled three previously-skipped Jetstream email-verification tests.
 - The legacy `/api/*` test suite stays green.
 
 ## Configuration reference
@@ -134,6 +153,7 @@ See `config/api.php`. Notable values:
 - `tokens.refresh_token_reuse_policy` (`revoke_family`)
 - `sync.pull_batch_size` (200), `sync.max_operations_per_push` (200)
 - `sync.change_log_retention_days` (30; `0` disables pruning)
+- `sync.idempotency_retention_days` (30; `0` keeps idempotency records forever)
 - `email_verification.enabled` (true), `enforce` (false), `expire_minutes` (60),
   `redirect_url` (null)
 - `security.revoke_sessions_on_password_change` / `_reset` (both `true`)
