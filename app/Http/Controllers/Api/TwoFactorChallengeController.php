@@ -7,7 +7,7 @@ use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
-use Laravel\Sanctum\Sanctum;
+use Laravel\Sanctum\PersonalAccessToken;
 use PragmaRX\Google2FA\Google2FA;
 
 class TwoFactorChallengeController extends Controller
@@ -56,7 +56,7 @@ class TwoFactorChallengeController extends Controller
             return null;
         }
 
-        $token = Sanctum::findAccessToken($plainTextToken);
+        $token = PersonalAccessToken::findToken($plainTextToken);
 
         if (! $token) {
             return null;
@@ -139,7 +139,7 @@ class TwoFactorChallengeController extends Controller
         $tokenParts = explode('|', $plainTextToken);
 
         if (count($tokenParts) === 2) {
-            $token = Sanctum::findAccessToken($plainTextToken);
+            $token = PersonalAccessToken::findToken($plainTextToken);
             if ($token) {
                 $token->delete();
             }
