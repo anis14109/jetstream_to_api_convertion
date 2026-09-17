@@ -7,11 +7,19 @@ use App\Models\User;
 use Illuminate\Database\QueryException;
 
 /**
- * Guarantees that a retried write operation is applied at most once.
+ * Guarantees that a retried mutation is applied at most once.
  *
  * A client supplies an `operation_id`. We hash it together with the user id,
- * persist the outcome of the first successful execution and replay that exact
- * outcome for any later request carrying the same id.
+ * persist a deterministic fingerprint of the request payload and the outcome
+ * of the first execution, then:
+ *
+ *   same operation id + same payload   -> replay the stored response
+ *   same operation id + different body -> idempotency conflict (409)
+ *
+ * Concurrency safety comes from a unique index on (user_id, key_hash) plus a
+ * reservation row written before the business operation runs. A second request
+ * arriving at the same moment fails to reserve, observes the in-flight row and
+ * must not execute the operation.
  */
 class IdempotencyService
 {
@@ -21,16 +29,15 @@ class IdempotencyService
     }
 
     /**
-     * A stable fingerprint of the request payload used to detect a reused
-     * operation id with a different body.
+     * A stable fingerprint of the request payload. Keys are sorted recursively
+     * so logically identical payloads always hash identically regardless of how
+     * the JSON was ordered on the wire.
      *
      * @param  array<string, mixed>  $payload
      */
     public function fingerprint(array $payload): string
     {
-        ksort($payload);
-
-        return hash('sha256', json_encode($payload) ?: '');
+        return hash('sha256', (string) json_encode($this->canonicalize($payload)));
     }
 
     public function find(User $user, string $operationId): ?IdempotencyKey
@@ -42,36 +49,105 @@ class IdempotencyService
     }
 
     /**
-     * Persist the result of an operation. Returns the existing record when a
-     * concurrent request won the race, making the endpoint safe under retries.
+     * Reserve the operation id before executing the business operation.
      *
-     * @param  array<string, mixed>  $fingerprintPayload
-     * @param  array<string, mixed>  $response
+     * @return array{status: 'new'|'replay'|'conflict'|'pending', key: ?IdempotencyKey, response: ?array<string, mixed>}
      */
-    public function store(
+    public function begin(
         User $user,
         string $operationId,
-        array $fingerprintPayload,
+        string $fingerprint,
         string $entityType,
         string $entityId,
         string $operation,
-        int $responseCode,
-        array $response,
-    ): IdempotencyKey {
+    ): array {
         try {
-            return IdempotencyKey::create([
+            $key = IdempotencyKey::create([
                 'user_id' => $user->id,
                 'key_hash' => $this->hashOperation($user, $operationId),
-                'request_hash' => $this->fingerprint($fingerprintPayload),
+                'request_hash' => $fingerprint,
                 'entity_type' => $entityType,
                 'entity_id' => $entityId,
                 'operation' => $operation,
-                'response_code' => $responseCode,
-                'response_json' => $response,
+                'response_code' => 200,
+                'response_json' => null,
+                'completed_at' => null,
             ]);
+
+            return ['status' => 'new', 'key' => $key, 'response' => null];
         } catch (QueryException $exception) {
-            // Another request with the same operation id committed first.
-            return $this->find($user, $operationId) ?? throw $exception;
+            // The unique (user_id, key_hash) index fired: another request owns
+            // this operation id. Inspect its state to decide how to respond.
+            $existing = $this->find($user, $operationId);
+
+            if (! $existing) {
+                throw $exception;
+            }
+
+            return $this->inspect($existing, $fingerprint);
         }
+    }
+
+    /**
+     * Persist the response of a successful operation so later retries replay it.
+     *
+     * @param  array<string, mixed>  $response
+     */
+    public function complete(IdempotencyKey $key, int $responseCode, array $response): void
+    {
+        $key->forceFill([
+            'response_code' => $responseCode,
+            'response_json' => $response,
+            'completed_at' => now(),
+        ])->save();
+    }
+
+    /**
+     * Release a reservation when the operation did not produce a business
+     * result (for example a version conflict) so the client may retry it.
+     */
+    public function release(IdempotencyKey $key): void
+    {
+        $key->delete();
+    }
+
+    /**
+     * @return array{status: 'replay'|'conflict'|'pending', key: IdempotencyKey, response: ?array<string, mixed>}
+     */
+    private function inspect(IdempotencyKey $existing, string $fingerprint): array
+    {
+        if (! hash_equals($existing->request_hash, $fingerprint)) {
+            return ['status' => 'conflict', 'key' => $existing, 'response' => null];
+        }
+
+        if ($existing->isPending()) {
+            return ['status' => 'pending', 'key' => $existing, 'response' => null];
+        }
+
+        return ['status' => 'replay', 'key' => $existing, 'response' => $existing->response_json];
+    }
+
+    /**
+     * Recursively sort associative arrays by key so the JSON encoding is
+     * deterministic. List arrays keep their order (order is meaningful).
+     *
+     * @param  array<mixed>  $value
+     * @return array<mixed>
+     */
+    private function canonicalize(array $value): array
+    {
+        if (array_is_list($value)) {
+            return array_map(
+                fn ($item) => is_array($item) ? $this->canonicalize($item) : $item,
+                $value,
+            );
+        }
+
+        ksort($value);
+
+        return array_map(
+            fn ($item) => is_array($item) ? $this->canonicalize($item) : $item,
+            $value,
+        );
     }
 }

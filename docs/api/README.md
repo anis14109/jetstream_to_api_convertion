@@ -12,9 +12,9 @@ unchanged for the existing first-party clients.
 
 | Document | Contents |
 |----------|----------|
-| [authentication.md](authentication.md) | Register, login, tokens, refresh, 2FA, password reset/confirm, sessions |
+| [authentication.md](authentication.md) | Register, login, tokens, refresh, email verification, 2FA, password reset/confirm, sessions |
 | [students.md](students.md) | Example resource: cursor pagination, optimistic concurrency, CRUD |
-| [sync.md](sync.md) | Offline-first pull/push contract, cursors, idempotency, conflicts |
+| [sync.md](sync.md) | Offline-first pull/ack/push contract, cursors, idempotency, conflicts, resource registration, pruning |
 | [errors.md](errors.md) | Error envelope, stable error codes, status codes, rate limits |
 
 ## Response envelope
@@ -55,6 +55,7 @@ present for conflicts (`SYNC_CONFLICT`).
 
 1. `POST /api/v1/auth/register` or `POST /api/v1/auth/login` returns an
    **access token** (short lived) and a **refresh token** (long lived, rotated).
+   Registration also sends an email-verification link (a signed API URL).
 2. Send the access token as `Authorization: Bearer <token>` on protected routes.
 3. When the access token expires, call `POST /api/v1/auth/refresh` with the
    refresh token to get a new pair. Refresh tokens rotate on every use.

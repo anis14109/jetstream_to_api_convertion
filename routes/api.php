@@ -8,6 +8,7 @@ use App\Http\Controllers\Api\ProfileController;
 use App\Http\Controllers\Api\TwoFactorChallengeController;
 use App\Http\Controllers\Api\TwoFactorController;
 use App\Http\Controllers\Api\V1\AuthController as V1AuthController;
+use App\Http\Controllers\Api\V1\EmailVerificationController as V1EmailVerificationController;
 use App\Http\Controllers\Api\V1\PasswordConfirmationController as V1PasswordConfirmationController;
 use App\Http\Controllers\Api\V1\PasswordResetController as V1PasswordResetController;
 use App\Http\Controllers\Api\V1\ProfileController as V1ProfileController;
@@ -100,6 +101,10 @@ Route::prefix('v1')->name('api.v1.')->group(function (): void {
             ->name('password.update');
     });
 
+    Route::middleware(['signed', 'throttle:api-email-verification'])
+        ->get('/auth/email/verify/{id}/{hash}', [V1EmailVerificationController::class, 'verify'])
+        ->name('auth.email.verify');
+
     /*
     |----------------------------------------------------------------------
     | Authenticated Routes
@@ -108,47 +113,58 @@ Route::prefix('v1')->name('api.v1.')->group(function (): void {
 
     Route::middleware(['auth:sanctum', 'throttle:api'])->group(function (): void {
 
-        // Authentication
+        // Authentication (always available, even when verification is enforced)
         Route::post('/auth/logout', [V1AuthController::class, 'logout'])->name('auth.logout');
         Route::post('/auth/logout-all', [V1AuthController::class, 'logoutAll'])->name('auth.logout-all');
         Route::get('/auth/me', [V1AuthController::class, 'me'])->name('auth.me');
 
-        // Profile
-        Route::get('/user', [V1ProfileController::class, 'show'])->name('user.show');
-        Route::match(['put', 'patch'], '/user', [V1ProfileController::class, 'update'])->name('user.update');
-        Route::put('/user/password', [V1ProfileController::class, 'updatePassword'])->name('user.password');
-        Route::delete('/user', [V1ProfileController::class, 'destroy'])->name('user.destroy');
+        // Email verification resend (available before the address is verified)
+        Route::middleware('throttle:api-email-verification')
+            ->post('/auth/email/verification-notification', [V1EmailVerificationController::class, 'send'])
+            ->name('auth.email.send');
 
-        // Password Confirmation
-        Route::post('/user/confirm-password', [V1PasswordConfirmationController::class, 'confirm'])
-            ->name('user.confirm-password');
+        // Everything below requires a verified email when enforcement is on
+        // (`api.email_verification.enforce`); the middleware decides at runtime.
+        Route::middleware('api-verified')->group(function (): void {
 
-        // Sessions
-        Route::get('/sessions', [V1SessionController::class, 'index'])->name('sessions.index');
-        Route::delete('/sessions/{session}', [V1SessionController::class, 'destroy'])->name('sessions.destroy');
+            // Profile
+            Route::get('/user', [V1ProfileController::class, 'show'])->name('user.show');
+            Route::match(['put', 'patch'], '/user', [V1ProfileController::class, 'update'])->name('user.update');
+            Route::put('/user/password', [V1ProfileController::class, 'updatePassword'])->name('user.password');
+            Route::delete('/user', [V1ProfileController::class, 'destroy'])->name('user.destroy');
 
-        // Two-Factor Authentication (password confirmation required)
-        Route::middleware('api-confirm-password')->group(function (): void {
-            Route::post('/two-factor/enable', [V1TwoFactorController::class, 'enable'])->name('two-factor.enable');
-            Route::post('/two-factor/confirm', [V1TwoFactorController::class, 'confirm'])->name('two-factor.confirm');
-            Route::delete('/two-factor', [V1TwoFactorController::class, 'disable'])->name('two-factor.disable');
-            Route::get('/two-factor/recovery-codes', [V1TwoFactorController::class, 'recoveryCodes'])
-                ->name('two-factor.recovery-codes');
+            // Password Confirmation
+            Route::post('/user/confirm-password', [V1PasswordConfirmationController::class, 'confirm'])
+                ->name('user.confirm-password');
+
+            // Sessions
+            Route::get('/sessions', [V1SessionController::class, 'index'])->name('sessions.index');
+            Route::delete('/sessions/{session}', [V1SessionController::class, 'destroy'])->name('sessions.destroy');
+
+            // Two-Factor Authentication (password confirmation required)
+            Route::middleware('api-confirm-password')->group(function (): void {
+                Route::post('/two-factor/enable', [V1TwoFactorController::class, 'enable'])->name('two-factor.enable');
+                Route::post('/two-factor/confirm', [V1TwoFactorController::class, 'confirm'])->name('two-factor.confirm');
+                Route::delete('/two-factor', [V1TwoFactorController::class, 'disable'])->name('two-factor.disable');
+                Route::get('/two-factor/recovery-codes', [V1TwoFactorController::class, 'recoveryCodes'])
+                    ->name('two-factor.recovery-codes');
+            });
+
+            // Offline sync (more generous rate limit than the default API bucket)
+            Route::middleware('throttle:api-sync')->group(function (): void {
+                Route::get('/sync/cursor', [V1SyncController::class, 'cursor'])->name('sync.cursor');
+                Route::get('/sync/pull', [V1SyncController::class, 'pull'])->name('sync.pull');
+                Route::post('/sync/ack', [V1SyncController::class, 'ack'])->name('sync.ack');
+                Route::post('/sync/push', [V1SyncController::class, 'push'])->name('sync.push');
+            });
+
+            // Students (example synchronizable resource)
+            Route::get('/students', [V1StudentController::class, 'index'])->name('students.index');
+            Route::post('/students', [V1StudentController::class, 'store'])->name('students.store');
+            Route::get('/students/{student}', [V1StudentController::class, 'show'])->name('students.show');
+            Route::match(['put', 'patch'], '/students/{student}', [V1StudentController::class, 'update'])
+                ->name('students.update');
+            Route::delete('/students/{student}', [V1StudentController::class, 'destroy'])->name('students.destroy');
         });
-
-        // Offline sync (more generous rate limit than the default API bucket)
-        Route::middleware('throttle:api-sync')->group(function (): void {
-            Route::get('/sync/cursor', [V1SyncController::class, 'cursor'])->name('sync.cursor');
-            Route::get('/sync/pull', [V1SyncController::class, 'pull'])->name('sync.pull');
-            Route::post('/sync/push', [V1SyncController::class, 'push'])->name('sync.push');
-        });
-
-        // Students (example synchronizable resource)
-        Route::get('/students', [V1StudentController::class, 'index'])->name('students.index');
-        Route::post('/students', [V1StudentController::class, 'store'])->name('students.store');
-        Route::get('/students/{student}', [V1StudentController::class, 'show'])->name('students.show');
-        Route::match(['put', 'patch'], '/students/{student}', [V1StudentController::class, 'update'])
-            ->name('students.update');
-        Route::delete('/students/{student}', [V1StudentController::class, 'destroy'])->name('students.destroy');
     });
 });

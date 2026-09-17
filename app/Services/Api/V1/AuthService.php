@@ -28,11 +28,17 @@ class AuthService
      */
     public function register(array $data): User
     {
-        return DB::transaction(fn (): User => User::create([
+        $user = DB::transaction(fn (): User => User::create([
             'name' => $data['name'],
             'email' => Str::lower($data['email']),
             'password' => $data['password'],
         ]));
+
+        if (config('api.email_verification.enabled')) {
+            $user->sendEmailVerificationNotification();
+        }
+
+        return $user;
     }
 
     public function validateCredentials(string $email, string $password, ?string $ip = null): ?User

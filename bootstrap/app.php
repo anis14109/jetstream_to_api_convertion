@@ -3,6 +3,7 @@
 use App\Exceptions\ApiException;
 use App\Exceptions\ConflictException;
 use App\Http\Middleware\ConfirmPassword;
+use App\Http\Middleware\EnsureApiEmailVerified;
 use App\Http\Middleware\EnsureApiPasswordConfirmed;
 use App\Support\ApiResponse;
 use App\Support\Enums\ApiErrorCode;
@@ -30,6 +31,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'confirm-password' => ConfirmPassword::class,
             'api-confirm-password' => EnsureApiPasswordConfirmed::class,
+            'api-verified' => EnsureApiEmailVerified::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

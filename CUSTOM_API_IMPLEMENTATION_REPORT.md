@@ -34,6 +34,12 @@ backwards compatibility.
   shares its cache key with the legacy middleware, so confirmation works across
   both API generations.
 - Password reset via Laravel's broker; reset revokes all sessions.
+- **Frontend-independent email verification**: `User` implements
+  `MustVerifyEmail`; registration sends `VerifyEmailApi` linking to a signed API
+  endpoint (`GET /auth/email/verify/{id}/{hash}`) that returns JSON (or redirects
+  to `EMAIL_VERIFICATION_REDIRECT_URL`). Resend endpoint
+  (`POST /auth/email/verification-notification`) is anti-enumeration. Enforcement
+  is opt-in via `EMAIL_VERIFICATION_ENFORCE`.
 
 ### Profile & password
 - View/update profile, change password (revokes all *other* sessions while
@@ -43,12 +49,27 @@ backwards compatibility.
 ### Offline-first synchronization
 - Append-only `change_logs` journal; the auto-increment `id` is the
   server-authoritative revision.
-- `GET /sync/cursor`, `GET /sync/pull`, `POST /sync/push`.
+- `GET /sync/cursor`, `GET /sync/pull`, `POST /sync/ack`, `POST /sync/push`.
+- **Pull and ACK are separate**: pull advances `last_pulled_cursor`, an explicit
+  ACK advances `acknowledged_cursor`. ACKing beyond what was delivered is
+  rejected; re-ACKing is an idempotent no-op.
 - Server-stored cursors keyed by session/token (`client_id`).
+- **Resource-agnostic engine** (`App\Sync\SyncEngine`): resources are registered
+  in `SyncResourceRegistry` via a `SyncResourceHandler`, so new entities need no
+  engine, controller or validation changes (validation is registry-driven).
+- **Per-resource conflict policies** (`manual_resolution`, `server_wins`,
+  `client_wins`, `field_level_merge`); structural conflicts are never
+  auto-resolved. `student` keeps `manual_resolution` for the `409 SYNC_CONFLICT`
+  contract.
 - Optimistic concurrency through a `version` column on `students`; stale writes
   return `409 SYNC_CONFLICT` with `server_data` to merge.
-- Idempotent push via client `operation_id` (hashed, unique per user);
-  replayed operations are reported in `replayed`, never re-applied.
+- **Idempotent push with payload binding**: an `operation_id` is reserved before
+  the write, replaying the same payload returns the stored response
+  (`replayed`), a different payload returns `409 IDEMPOTENCY_CONFLICT`, and an
+  in-flight reservation returns `409 IDEMPOTENCY_IN_PROGRESS`.
+- **ACK-aware pruning**: `sync:prune-change-log` (scheduled daily) deletes only
+  entries older than the retention window and not beyond the slowest client's
+  acknowledged cursor.
 - Soft-delete tombstones so deletions propagate.
 
 ### Example resource
@@ -92,11 +113,15 @@ backwards compatibility.
 
 ```
 php artisan test --compact
-144 tests, 140 passed, 4 skipped, 458 assertions
+171 tests, 167 passed, 4 skipped, 556 assertions
 ```
 
-- `tests/Feature/Api/V1` — 53 tests covering auth, profile, password reset,
-  password confirmation, 2FA, sessions, students and sync.
+- `tests/Feature/Api/V1` — auth, profile, password reset, password confirmation,
+  2FA, sessions, students, sync, a generic-engine test proving an arbitrary
+  registered resource round-trips and where each conflict policy is exercised,
+  and email verification.
+- `tests/Feature/Sync` — change-log pruning (retention, slowest-client
+  acknowledgement, dry-run, disabled).
 - 4 skipped tests are pre-existing Jetstream feature-gate skips, unchanged by
   this work.
 - The legacy `/api/*` test suite stays green.
@@ -108,31 +133,36 @@ See `config/api.php`. Notable values:
 - `tokens.access_token_ttl` (15 min), `tokens.refresh_token_ttl` (14 days)
 - `tokens.refresh_token_reuse_policy` (`revoke_family`)
 - `sync.pull_batch_size` (200), `sync.max_operations_per_push` (200)
+- `sync.change_log_retention_days` (30; `0` disables pruning)
+- `email_verification.enabled` (true), `enforce` (false), `expire_minutes` (60),
+  `redirect_url` (null)
 - `security.revoke_sessions_on_password_change` / `_reset` (both `true`)
 - `pagination.default_per_page` (20) / `max_per_page` (100)
 
 ## Known limitations & follow-ups
 
-- `User` does not implement `MustVerifyEmail` (commented out in this project),
-  so email changes do not trigger verification. Enable it if required.
-- Change-log pruning (`SYNC_CHANGE_LOG_RETENTION_DAYS`) is configured but no
-  scheduled prune command is registered yet.
-- Only `student` is wired into `SyncService`; new syncable entities must be
-  added to the `match` in `SyncService::apply()` and to the `PushRequest`
-  `entity_type` rule.
+- Email verification is implemented but **not enforced** by default so current
+  clients keep working. Set `EMAIL_VERIFICATION_ENFORCE=true` to require it.
+- Only `student` is registered in `SyncResourceRegistry`; adding another
+  resource is a handler plus one `register()` line, with no engine changes.
 - Cursor pagination on `students` orders by `id` (ULID) for stability; if you
   need another order, choose a unique, indexed sort key.
 
 ## File inventory
 
 New code lives under `app/Exceptions`, `app/Http/Controllers/Api/V1`,
+`app/Http/Middleware/EnsureApiEmailVerified.php`,
 `app/Http/Middleware/EnsureApiPasswordConfirmed.php`, `app/Http/Requests/Api/V1`,
-`app/Http/Resources/Api/V1`, `app/Models/{AuthSession,ChangeLog,IdempotencyKey,RefreshToken,Student,SyncCursor}.php`,
-`app/Models/Concerns/UsesUlid.php`, `app/Policies`, `app/Rules`, `app/Services/Api/V1`,
-`app/Support`, `config/api.php`, the seven `2026_09_17_0523*` migrations,
-`database/factories/{AuthSession,RefreshToken,Student}Factory.php`, and
-`tests/Feature/Api/V1`. Docs live in `docs/api/`.
+`app/Http/Resources/Api/V1`, `app/Notifications`,
+`app/Models/{AuthSession,ChangeLog,IdempotencyKey,RefreshToken,Student,SyncCursor}.php`,
+`app/Models/Concerns/UsesUlid.php`, `app/Policies`, `app/Rules`,
+`app/Services/Api/V1`, `app/Sync`, `app/Support`, `config/api.php`, the
+`2026_09_17_0523*`, `2026_09_17_0652*` migrations,
+`database/factories/{AuthSession,RefreshToken,Student}Factory.php`,
+`tests/Feature/Api/V1`, `tests/Feature/Sync` and `tests/Support`. Docs live in
+`docs/api/`.
 
-Modified: `bootstrap/app.php`, `routes/api.php`, `app/Providers/AppServiceProvider.php`,
+Modified: `bootstrap/{app,providers}.php`, `routes/{api,console}.php`,
+`app/Providers/{AppServiceProvider,SyncServiceProvider}.php`,
 `app/Models/User.php`, `app/Http/Controllers/Api/TwoFactorChallengeController.php`
 (Sanctum 4 fix). See `CUSTOM_API_PORTABILITY.md` for the porting checklist.

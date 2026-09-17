@@ -145,6 +145,47 @@ and shared with the legacy middleware. A wrong password returns
 Protected 2FA routes return `423 PASSWORD_CONFIRMATION_REQUIRED` until
 confirmation succeeds.
 
+## Email verification
+
+Registration sends a verification email whose link points at a **signed API
+URL**, so verification never depends on a Blade page:
+
+```
+GET /api/v1/auth/email/verify/{id}/{hash}?signature=...
+```
+
+The link is signed and expires after `EMAIL_VERIFICATION_EXPIRE_MINUTES`
+(default 60). Hit it with the client's HTTP stack (no `Authorization` header is
+required). It returns:
+
+```json
+{
+  "success": true,
+  "message": "Email address verified.",
+  "data": { "verified": true, "email_verified_at": "2026-09-17T12:05:00.000000Z" }
+}
+```
+
+If `EMAIL_VERIFICATION_REDIRECT_URL` is set, the endpoint instead redirects
+there with `?verified=1` (for browser/deep-link flows). An invalid hash returns
+`403 FORBIDDEN`; an expired or tampered signature returns `403`.
+
+Resend the notification (requires an access token):
+
+```
+POST /api/v1/auth/email/verification-notification
+```
+
+Always returns `200` with the same message whether or not the account exists in
+an unverified state, so it does not leak account status. Notifications are sent
+only when `EMAIL_VERIFICATION_ENABLED=true` (default).
+
+By default, unverified users may still use the API so existing clients keep
+working. Set `EMAIL_VERIFICATION_ENFORCE=true` to require a verified email on
+the authenticated routes (profile, sessions, 2FA, sync and students); `logout`,
+`/auth/me` and the verification resend endpoint stay reachable, and blocked
+requests return `403 EMAIL_NOT_VERIFIED`.
+
 ## Password reset
 
 `POST /auth/forgot-password` — rate limit `api-password-reset`

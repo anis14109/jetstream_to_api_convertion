@@ -18,6 +18,7 @@ class IdempotencyKey extends Model
         'operation',
         'response_code',
         'response_json',
+        'completed_at',
         'created_at',
     ];
 
@@ -26,11 +27,26 @@ class IdempotencyKey extends Model
         return [
             'response_code' => 'integer',
             'response_json' => 'array',
+            'completed_at' => 'datetime',
         ];
     }
 
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    /**
+     * A reservation that has not yet produced a stored response. A concurrent
+     * request holding the same operation id must not execute the operation.
+     */
+    public function isPending(): bool
+    {
+        return $this->completed_at === null;
+    }
+
+    public function isCompleted(): bool
+    {
+        return $this->completed_at !== null;
     }
 }

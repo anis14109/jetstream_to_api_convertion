@@ -26,11 +26,13 @@ Everything below is self-contained. Copy the directories/files verbatim.
 
 ```
 app/
+  Console/Commands/PruneChangeLog.php
   Exceptions/
     ApiException.php
     ConflictException.php
   Http/
-    Controllers/Api/V1/            # 9 controllers
+    Controllers/Api/V1/            # 10 controllers
+    Middleware/EnsureApiEmailVerified.php
     Middleware/EnsureApiPasswordConfirmed.php
     Requests/Api/V1/               # form requests
     Resources/Api/V1/              # API resources
@@ -42,9 +44,12 @@ app/
     Student.php
     SyncCursor.php
     Concerns/UsesUlid.php
+  Notifications/VerifyEmailApi.php
   Policies/StudentPolicy.php
+  Providers/SyncServiceProvider.php
   Rules/UuidOrUlid.php
   Services/Api/V1/                 # AuthService, RefreshTokenService, ...
+  Sync/                            # SyncEngine, registry, contract, handlers
   Support/
     ApiResponse.php
     Enums/ApiErrorCode.php
@@ -54,12 +59,16 @@ database/
   factories/RefreshTokenFactory.php
   factories/StudentFactory.php
   migrations/2026_09_17_0523*.php  # 7 migrations
+  migrations/2026_09_17_0652*.php  # idempotency completed_at + cursor split
 tests/Feature/Api/V1/              # feature tests + ApiV1Helpers trait
+tests/Feature/Sync/                # pruning tests
+tests/Support/                     # in-memory sync handler used by the engine test
 ```
 
 `Student` is an **example** synchronizable resource. Keep it to prove the
-contract, then replace or extend it with your own resources using the same
-pattern (`UsesUlid`, `version`, soft deletes, `ChangeTracker` on every write).
+contract, then replace or extend it with your own resources by writing a
+`SyncResourceHandler` and registering it in `SyncServiceProvider` (see
+`docs/api/sync.md`).
 
 ## 3. Wire it up
 
@@ -77,6 +86,7 @@ Register the middleware alias and the exception renderers:
 ->withMiddleware(function (Middleware $middleware): void {
     $middleware->alias([
         'api-confirm-password' => EnsureApiPasswordConfirmed::class,
+        'api-verified' => EnsureApiEmailVerified::class,
     ]);
 })
 ->withExceptions(function (Exceptions $exceptions): void {
@@ -97,11 +107,27 @@ Copy `configureRateLimiting()` and its helpers (`limit`, `credentialKey`,
 `userKey`) and call it from `boot()`. The named limiters are referenced by the
 routes via `throttle:api-login` etc.
 
+### `app/Providers/SyncServiceProvider.php`
+
+Register it in `bootstrap/providers.php`. It binds `SyncResourceRegistry` as a
+singleton and registers the handlers a client can synchronize. Add your own
+resources here.
+
+### `routes/console.php`
+
+Schedule the pruning command:
+
+```php
+Schedule::command('sync:prune-change-log')->daily()->withoutOverlapping();
+```
+
 ### `app/Models/User.php`
 
 Add the relations and traits the API relies on (see the diff of this project's
-`User`): `authSessions()`, `refreshTokens()`, `students()`, plus the existing
-Sanctum `HasApiTokens` trait.
+`User`): `authSessions()`, `refreshTokens()`, `students()`, the Sanctum
+`HasApiTokens` trait, `implements MustVerifyEmail`, and the
+`sendEmailVerificationNotification()` override that sends `VerifyEmailApi`
+(a signed API URL instead of a Blade route).
 
 ### Sanctum
 
@@ -120,6 +146,8 @@ is filled via `forceFill`).
 2026_09_17_052341_change_logs_table
 2026_09_17_052342_idempotency_keys_table
 2026_09_17_052343_sync_cursors_table
+2026_09_17_065222_add_completed_at_to_idempotency_keys_table
+2026_09_17_065452_split_sync_cursor_into_pulled_and_acknowledged
 ```
 
 `users.id` is assumed to be an integer/bigint (Laravel default). The `user_id`
@@ -138,7 +166,12 @@ TWO_FACTOR_CHALLENGE_TTL=5
 SYNC_PULL_BATCH_SIZE=200
 SYNC_PUSH_BATCH_SIZE=100
 SYNC_MAX_OPERATIONS_PER_PUSH=200
-SYNC_CHANGE_LOG_RETENTION_DAYS=0
+SYNC_CHANGE_LOG_RETENTION_DAYS=30
+
+EMAIL_VERIFICATION_ENABLED=true
+EMAIL_VERIFICATION_ENFORCE=false
+EMAIL_VERIFICATION_EXPIRE_MINUTES=60
+# EMAIL_VERIFICATION_REDIRECT_URL=https://app.example.com/verified
 
 RATE_LIMIT_REGISTER=5,15
 RATE_LIMIT_LOGIN=10,1
@@ -148,6 +181,7 @@ RATE_LIMIT_PASSWORD_CONFIRMATION=10,1
 RATE_LIMIT_TWO_FACTOR=10,1
 RATE_LIMIT_API=240,1
 RATE_LIMIT_SYNC=120,1
+RATE_LIMIT_EMAIL_VERIFICATION=3,1
 
 REVOKE_SESSIONS_ON_PASSWORD_CHANGE=true
 REVOKE_SESSIONS_ON_PASSWORD_RESET=true
@@ -175,7 +209,8 @@ The v1 API does not use Jetstream or Fortify. If you remove them:
 ```bash
 php artisan route:list --path=api/v1
 php artisan migrate
-php artisan test --compact tests/Feature/Api/V1
+php artisan test --compact tests/Feature/Api/V1 tests/Feature/Sync
+php artisan schedule:list          # shows sync:prune-change-log
 ```
 
 `ApiV1Helpers` registers users, logs in and authenticates requests. Note the

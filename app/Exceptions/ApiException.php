@@ -77,4 +77,32 @@ class ApiException extends RuntimeException
     {
         return new self(ApiErrorCode::OperationFailed, $message, $status);
     }
+
+    /**
+     * @param  array<string, mixed>  $context
+     */
+    public static function idempotencyConflict(array $context = []): self
+    {
+        return new self(
+            ApiErrorCode::IdempotencyConflict,
+            'This operation id was already used with a different request payload.',
+            409,
+            [],
+            $context,
+        );
+    }
+
+    /**
+     * @param  array<string, mixed>  $context
+     */
+    public static function idempotencyInProgress(array $context = []): self
+    {
+        return new self(
+            ApiErrorCode::IdempotencyInProgress,
+            'An operation with this operation id is still being processed. Retry shortly.',
+            409,
+            [],
+            $context,
+        );
+    }
 }

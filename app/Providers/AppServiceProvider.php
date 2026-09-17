@@ -78,6 +78,13 @@ class AppServiceProvider extends ServiceProvider
 
             return Limit::perMinutes($decay, $max)->by($this->userKey($request, 'sync'));
         });
+
+        RateLimiter::for('api-email-verification', function (Request $request) {
+            [$max, $decay] = $this->limit('email_verification');
+
+            return Limit::perMinutes($decay, $max)
+                ->by($this->userKey($request, 'email-verification-'.$request->route('id', 'guest')));
+        });
     }
 
     /**
